@@ -1,0 +1,1264 @@
+diff --git a/benchmarks/session-corpus/cold-history-retention.perf.ts b/benchmarks/session-corpus/cold-history-retention.perf.ts
+new file mode 100644
+index 00000000..aee3c7b9
+--- /dev/null
++++ b/benchmarks/session-corpus/cold-history-retention.perf.ts
+@@ -0,0 +1,82 @@
++/** Measure retained heap after consecutive reads of isolated synthetic Zstd histories. */
++import { mkdtemp, realpath, rm } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { dirname, join } from 'node:path'
++import { scheduler } from 'node:timers/promises'
++import { Context } from '@deepseek-ai/cordis'
++import { createUserMessage } from '@deepseek-ai/dsh-llm'
++import SessionStore, { SessionId, SessionSeq, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
++import type { SessionEvent } from '@deepseek-ai/dsh-session'
++import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
++import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
++
++const SESSION_COUNT = 8
++const EVENTS_PER_SESSION = 768
++const CHARS_PER_EVENT = 32768
++
++function mib(bytes: number): number {
++  return Math.round(bytes / 104_857.6) / 10
++}
++
++async function heapAfterGc(): Promise<number> {
++  const gc = globalThis.gc
++  if (gc === undefined) throw new Error('Run with --expose-gc')
++  await scheduler.yield()
++  gc()
++  await scheduler.yield()
++  gc()
++  return mib(process.memoryUsage().heapUsed)
++}
++
++async function seed(ctx: Context, cwd: string): Promise<void> {
++  for (let index = 0; index < SESSION_COUNT; index++) {
++    const id = SessionId(`cold-${index}`)
++    await using writer = await ctx.sessionPersistence.create({
++      id, cwd, createdAt: index + 1, isSeeded: false, version: SESSION_FORMAT_VERSION,
++    })
++    for (let offset = 0; offset < EVENTS_PER_SESSION; offset += 64) {
++      const events = Array.from({ length: 64 }, (_, i): SessionEvent => {
++        const seq = offset + i
++        return {
++          type: 'user/message', seq: SessionSeq(seq), time: seq + 1, surfaceOp: 'append',
++          data: createUserMessage({
++            content: [{ type: 'text', text: `${index}/${seq}/${'λ'.repeat(CHARS_PER_EVENT)}` }],
++            source: { kind: 'user' },
++          }),
++        }
++      })
++      await writer.append(events)
++    }
++  }
++}
++
++async function readOnce(ctx: Context, index: number): Promise<number> {
++  using observation = await ctx.sessionQuery.observeSession(SessionId(`cold-${index}`), { projectionMode: 'none' })
++  if (observation.events.length !== EVENTS_PER_SESSION) throw new Error('Synthetic history changed')
++  return mib(process.memoryUsage().heapUsed)
++}
++
++const tempParent = await realpath(tmpdir())
++const root = await mkdtemp(join(tempParent, 'dsh-cold-history-perf-'))
++if (dirname(root) !== tempParent) throw new Error('Unexpected benchmark directory')
++const ctx = new Context()
++try {
++  await ctx.plugin(SessionStore)
++  await ctx.plugin(JsonlSessionPersistence, { root: join(root, 'sessions'), compression: 'zstd' })
++  await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
++  await seed(ctx, root)
++  const startMiB = await heapAfterGc()
++  const releasedMiB: number[] = []
++  let peakSampleMiB = 0
++  for (let index = 0; index < SESSION_COUNT; index++) {
++    peakSampleMiB = Math.max(peakSampleMiB, await readOnce(ctx, index))
++    releasedMiB.push(await heapAfterGc())
++  }
++  console.log(JSON.stringify({ startMiB, releasedMiB, peakSampleMiB }))
++} finally {
++  try {
++    await ctx.fiber.dispose()
++  } finally {
++    await rm(root, { recursive: true, force: true })
++  }
++}
+diff --git a/docs/config-catalog.md b/docs/config-catalog.md
+index e691d06b..1e4bbb32 100644
+--- a/docs/config-catalog.md
++++ b/docs/config-catalog.md
+@@ -3272,7 +3272,7 @@ export interface Config {
+ 
+ - `inject`: `sessions`
+ - `refs`: [`SessionQueryConfig`](../packages/session-query/session-query/src/index.ts)
+-- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:92`](../packages/session-query/session-query-sqlite/src/index.ts)
++- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:93`](../packages/session-query/session-query-sqlite/src/index.ts)
+ 
+ ```ts config-catalog
+ /** Combined session-query configuration backed by SQLite full-text search. */
+@@ -3303,6 +3303,8 @@ export interface Config extends SessionQueryConfig {
+   persistedReadConcurrency?: number
+   /** Maximum cold prepared-Session observations the inherited reader retains for reuse. Defaults to 5. */
+   preparedSessionCacheSize?: number
++  /** Estimated decoded-log bytes retained after cold observations are released. Defaults to 32 MiB. */
++  preparedSessionCacheMaxBytes?: number
+ }
+ 
+ /** SQLite module/handle opening phase; `never` disables full-text search entirely. */
+diff --git a/docs/config-catalog.zh.md b/docs/config-catalog.zh.md
+index 2f7d8eb2..92a5d031 100644
+--- a/docs/config-catalog.zh.md
++++ b/docs/config-catalog.zh.md
+@@ -3274,7 +3274,7 @@ export interface Config {
+ 
+ - `inject`: `sessions`
+ - `refs`: [`SessionQueryConfig`](../packages/session-query/session-query/src/index.ts)
+-- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:92`](../packages/session-query/session-query-sqlite/src/index.ts)
++- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:93`](../packages/session-query/session-query-sqlite/src/index.ts)
+ 
+ ```ts config-catalog
+ /** Combined session-query configuration backed by SQLite full-text search. */
+@@ -3305,6 +3305,8 @@ export interface Config extends SessionQueryConfig {
+   persistedReadConcurrency?: number
+   /** Maximum cold prepared-Session observations the inherited reader retains for reuse. Defaults to 5. */
+   preparedSessionCacheSize?: number
++  /** Estimated decoded-log bytes retained after cold observations are released. Defaults to 32 MiB. */
++  preparedSessionCacheMaxBytes?: number
+ }
+ 
+ /** SQLite module/handle opening phase; `never` disables full-text search entirely. */
+diff --git a/packages/api/session-controller/src/web/controller.ts b/packages/api/session-controller/src/web/controller.ts
+index 7e849e4c..577993b7 100644
+--- a/packages/api/session-controller/src/web/controller.ts
++++ b/packages/api/session-controller/src/web/controller.ts
+@@ -38,41 +38,38 @@ export class WebController {
+     using assistantListener = request.assistantStream === true
+       ? streams.bind(sessionId, signal, queue)
+       : undefined
+-    using observation = await this.historyController.usingObservation({ sessionId, projection: true }, signal)
++    yield await this.historyController.usingObservation({ sessionId, projection: true }, signal, (observation) => {
++      validateObservationAddress(request.address, observation)
++      let opening: SessionFollowFrame = {
++        type: 'snapshot',
++        header: { ...observation.header },
++        projections: projections(observation),
++        ...history(observation, spec),
++      }
++      listener.setCursor(opening.cursor)
++      if (assistantListener !== undefined) {
++        const { baseline: assistantStream, ordinal } = assistantListener.snapshot()
++        opening = { ...opening, assistantStream }
++        assistantListener.setOrdinalCut(ordinal)
++      }
++      if (request.activate === true && !signal.aborted
++        && observation.header.origin !== 'subagent' && observation.source === 'prepared') {
++        const promotion = observation.retain()
++        try {
++          this.promote(promotion)
++        } catch (error: unknown) {
++          promotion[Symbol.dispose]()
++          throw error
++        }
++      }
++      // The generator only yields the page. The opening lease and full log
++      // stay on the callback stack, which settles before the stream suspends.
++      return opening
++    })
+       .catch((error: unknown) => {
+         if (remoteErrorOf(error)?.code === 'session/not-found') rejectNotFound(request.address)
+         throw error
+       })
+-    validateObservationAddress(request.address, observation)
+-    let opening: SessionFollowFrame = {
+-      type: 'snapshot',
+-      header: { ...observation.header },
+-      projections: projections(observation),
+-      ...history(observation, spec),
+-    }
+-    listener.setCursor(opening.cursor)
+-    if (assistantListener !== undefined) {
+-      const { baseline: assistantStream, ordinal } = assistantListener.snapshot()
+-      opening = { ...opening, assistantStream }
+-      assistantListener.setOrdinalCut(ordinal)
+-    }
+-    // Increments come from the queue, so the opening ends this lease in every branch;
+-    // activation continues on its own retained lease. Promotion starts before the opening is
+-    // delivered, so a consumer that stops after the snapshot still gets the activation it asked for.
+-    if (request.activate === true && !signal.aborted
+-      && observation.header.origin !== 'subagent' && observation.source === 'prepared') {
+-      const promotion = observation.retain()
+-      observation[Symbol.dispose]()
+-      try {
+-        this.promote(promotion)
+-      } catch (error: unknown) {
+-        promotion[Symbol.dispose]()
+-        throw error
+-      }
+-    } else {
+-      observation[Symbol.dispose]()
+-    }
+-    yield opening
+     yield* queue.items()
+   }
+ }
+diff --git a/packages/session-query/session-query-sqlite/README.md b/packages/session-query/session-query-sqlite/README.md
+index 3b16bc78..c527bd62 100644
+--- a/packages/session-query/session-query-sqlite/README.md
++++ b/packages/session-query/session-query-sqlite/README.md
+@@ -51,6 +51,7 @@ Choose it when you want full-text recall over prior sessions with ranking and pa
+ | `readWindowMax` | `50` | Maximum `before`/`after` raw events for the inherited `readEvent()` |
+ | `persistedReadConcurrency` | `4` | Concurrent persisted-log reads for inherited batch reads |
+ | `preparedSessionCacheSize` | `5` | Cold prepared-Session observations the inherited `observeSession` reader retains for reuse |
++| `preparedSessionCacheMaxBytes` | `33554432` | Estimated decoded-log bytes the inherited reader retains for reuse after release |
+ 
+ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-session-query-sqlite) is the exhaustive source for every accepted field and its JSDoc.
+ 
+diff --git a/packages/session-query/session-query-sqlite/README.zh.md b/packages/session-query/session-query-sqlite/README.zh.md
+index 53784fab..ca2857b4 100644
+--- a/packages/session-query/session-query-sqlite/README.zh.md
++++ b/packages/session-query/session-query-sqlite/README.zh.md
+@@ -51,6 +51,7 @@ kind: "package-reference"
+ | `readWindowMax` | `50` | 继承的 `readEvent()` 的 `before`/`after` 原始事件数上限 |
+ | `persistedReadConcurrency` | `4` | 继承批量读取的并发持久化日志读取数 |
+ | `preparedSessionCacheSize` | `5` | 继承的 `observeSession` 读取器为复用保留的冷 prepared-Session 观察数 |
++| `preparedSessionCacheMaxBytes` | `33554432` | 继承的读取器在租约释放后为复用保留的已解码日志估算字节数 |
+ 
+ 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-session-query-sqlite)是每个受支持字段及其 JSDoc 的穷尽式真源。
+ 
+diff --git a/packages/session-query/session-query-sqlite/src/index.ts b/packages/session-query/session-query-sqlite/src/index.ts
+index 7c95afa2..03400a1b 100644
+--- a/packages/session-query/session-query-sqlite/src/index.ts
++++ b/packages/session-query/session-query-sqlite/src/index.ts
+@@ -18,6 +18,7 @@ import type {
+ import SessionQueryEngine, {
+   SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
+   SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
++  SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES,
+   SESSION_QUERY_READ_WINDOW_MAX,
+   SessionQueryError,
+   SessionSearchCursor,
+@@ -116,6 +117,8 @@ export interface Config extends SessionQueryConfig {
+   persistedReadConcurrency?: number
+   /** Maximum cold prepared-Session observations the inherited reader retains for reuse. Defaults to 5. */
+   preparedSessionCacheSize?: number
++  /** Estimated decoded-log bytes retained after cold observations are released. Defaults to 32 MiB. */
++  preparedSessionCacheMaxBytes?: number
+ }
+ 
+ interface ResolvedConfig {
+@@ -128,6 +131,7 @@ interface ResolvedConfig {
+   readWindowMax: number
+   persistedReadConcurrency: number
+   preparedSessionCacheSize: number
++  preparedSessionCacheMaxBytes: number
+ }
+ 
+ interface ObservedSession {
+@@ -221,6 +225,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
+       .min(1)
+       .max(Number.MAX_SAFE_INTEGER)
+       .default(SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE),
++    preparedSessionCacheMaxBytes: z.number()
++      .step(1)
++      .min(0)
++      .max(Number.MAX_SAFE_INTEGER)
++      .default(SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES),
+   })
+ 
+   /** Validated and defaulted backend configuration. */
+@@ -1030,6 +1039,8 @@ function resolveConfig(config: Config): ResolvedConfig {
+       ?? SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
+     preparedSessionCacheSize: config.preparedSessionCacheSize
+       ?? SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
++    preparedSessionCacheMaxBytes: config.preparedSessionCacheMaxBytes
++      ?? SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES,
+   }
+   if (typeof resolved.path !== 'string' || resolved.path.trim().length === 0) {
+     throw invalidConfig('path must not be blank')
+diff --git a/packages/session-query/session-query/README.md b/packages/session-query/session-query/README.md
+index 61104322..d4575f4e 100644
+--- a/packages/session-query/session-query/README.md
++++ b/packages/session-query/session-query/README.md
+@@ -59,6 +59,7 @@ The inherited knobs are set through the mounted backend's config:
+ | `readWindowMax` | `50` | Maximum `before`/`after` raw events accepted by `readEvent` |
+ | `persistedReadConcurrency` | `4` | Concurrent persisted-log reads in one batch title read |
+ | `preparedSessionCacheSize` | `5` | Cold prepared-Session observations retained for reuse across `observeSession` reads |
++| `preparedSessionCacheMaxBytes` | `33554432` | Estimated decoded-log bytes available for reuse after release |
+ 
+ ### Failures and recovery
+ 
+@@ -107,6 +108,8 @@ The decision history lives in the [unified service decision](../../../.agents/no
+ 
+ ### Observation cache
+ 
++Released logs share an estimated decoded-byte budget. An observation above that budget remains reusable while it has active leases and leaves the cache when its final lease releases. A zero-byte budget releases every cold entry when its final lease ends. These limits govern reuse of decoded history, while a reader can still load a complete log.
++
+ `observeSession` builds point observations without a listing preflight. A live observation fixes its cut as the current log length and materializes `events` on first read, so header-, cursor-, or projection-only consumers never copy the log; the log only appends, so a late first read still yields exactly that prefix. The cold path stats the stored session first and consults its own bounded cache keyed by the persistence instance and the `stat` revision: an unchanged revision reuses the restored unpublished Session without re-reading the log; a changed revision, or a replaced persistence instance, reloads through the handle seam and replaces the entry. The cache holds `preparedSessionCacheSize` entries with least-recently-used eviction, entries pinned by active observation leases are never evicted, and a session that goes live mid-read retries the live path.
+ 
+ `inspectSession(id, read, signal?)` prepares a cold Session without publishing or resuming it and calls a synchronous domain getter at a fresh live or prepared cut. The getter may read its owned projection or resolve policy; it must not mutate or retain the Session. The observation is released after the getter returns or throws; callers retain only the returned data. Preparation uses the observation cache and validates persisted history.
+diff --git a/packages/session-query/session-query/README.zh.md b/packages/session-query/session-query/README.zh.md
+index 3c9bfb32..b8c2c37e 100644
+--- a/packages/session-query/session-query/README.zh.md
++++ b/packages/session-query/session-query/README.zh.md
+@@ -59,6 +59,7 @@ kind: "package-reference"
+ | `readWindowMax` | `50` | `readEvent` 接受的 `before`/`after` 原始事件数上限 |
+ | `persistedReadConcurrency` | `4` | 一次批量标题读取中的并发持久化日志读取数 |
+ | `preparedSessionCacheSize` | `5` | 为跨 `observeSession` 读取复用而保留的冷 prepared-Session 观察数 |
++| `preparedSessionCacheMaxBytes` | `33554432` | 租约释放后可供复用的已解码日志估算字节数 |
+ 
+ ### 失败与恢复
+ 
+@@ -107,6 +108,8 @@ kind: "package-reference"
+ 
+ ### 观察缓存
+ 
++已释放的日志共享已解码字节的估算预算。超过预算的观察在活跃租约期间可复用，最后一个租约释放时退出缓存。预算为零时，每个冷条目在最后一个租约释放后即退出缓存。预算约束解码历史的复用，读取器仍可加载完整日志。
++
+ `observeSession` 不经过列表预检直接构建定点观察。实时观察以当前日志长度固定 cut，并在首次读取时才物化 `events`，因此只需要 header、cursor 或 projection 的消费者永远不会复制日志；日志只会追加，所以延后的首次读取得到的仍然正好是该前缀。冷路径先对存储会话执行 `stat`，再查询自有的有界缓存，缓存键为持久化实例加 `stat` 修订：修订未变则复用已恢复的未发布 Session，不再重读日志；修订变化或持久化实例被替换则经句柄 seam 重新加载并替换条目。缓存保留 `preparedSessionCacheSize` 个条目并按最久未用淘汰，被活跃观察租约钉住的条目从不被淘汰；读取中途转为实时的会话会重试实时路径。
+ 
+ `inspectSession(id, read, signal?)` 准备冷 Session，但不发布或恢复运行它，然后在新的实时或准备状态截面上调用同步的领域读取函数。读取函数可以读取自己拥有的投影或解析策略，但不能修改或保留 Session。读取函数返回或抛出异常后都会释放观察；调用方只保留返回的数据。准备过程复用观察缓存并验证持久化历史。
+diff --git a/packages/session-query/session-query/src/config.ts b/packages/session-query/session-query/src/config.ts
+index e5475e3d..c35a747d 100644
+--- a/packages/session-query/session-query/src/config.ts
++++ b/packages/session-query/session-query/src/config.ts
+@@ -10,6 +10,8 @@ export const SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY = 4
+ 
+ /** Default maximum number of cold prepared-Session observations retained for reuse. */
+ export const SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE = 5
++/** Default estimated decoded-log budget for idle cold observations. */
++export const SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES = 32 * 1024 * 1024
+ 
+ /** Backend-independent configuration inherited by every session-query implementation. */
+ export interface Config {
+@@ -23,6 +25,11 @@ export interface Config {
+    * against this bound until released. Defaults to 5.
+    */
+   preparedSessionCacheSize?: number
++  /**
++   * Estimated decoded-log bytes retained for reuse. Active leases can exceed
++   * the budget until released. Zero disables retention after release.
++   */
++  preparedSessionCacheMaxBytes?: number
+ }
+ 
+ /** Stable machine-routable failure taxonomy for session reads, traces, and search. */
+diff --git a/packages/session-query/session-query/src/index.ts b/packages/session-query/session-query/src/index.ts
+index dfb11fec..430d8ce6 100644
+--- a/packages/session-query/session-query/src/index.ts
++++ b/packages/session-query/session-query/src/index.ts
+@@ -40,6 +40,7 @@ import type {
+ import {
+   SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
+   SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
++  SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES,
+   SESSION_QUERY_READ_WINDOW_MAX,
+   SessionQueryError,
+   type Config,
+@@ -65,6 +66,7 @@ export type { Config, SessionQueryErrorCode } from './config.ts'
+ export {
+   SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
+   SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
++  SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES,
+   SESSION_QUERY_READ_WINDOW_MAX,
+   SessionQueryError,
+ } from './config.ts'
+@@ -128,7 +130,15 @@ export abstract class SessionQueryEngine extends Service {
+       )
+     }
+     this._corpus = new SessionCorpus(ctx, persistedReadConcurrency)
+-    this._observations = new SessionObservationReader(ctx, preparedSessionCacheSize)
++    const preparedSessionCacheMaxBytes = config.preparedSessionCacheMaxBytes
++      ?? SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES
++    if (!Number.isSafeInteger(preparedSessionCacheMaxBytes) || preparedSessionCacheMaxBytes < 0) {
++      throw new SessionQueryError(
++        'session-query: preparedSessionCacheMaxBytes must be a non-negative safe integer',
++        'SESSION_QUERY_INVALID_CONFIG',
++      )
++    }
++    this._observations = new SessionObservationReader(ctx, preparedSessionCacheSize, preparedSessionCacheMaxBytes)
+   }
+ 
+   /**
+diff --git a/packages/session-query/session-query/src/observation.ts b/packages/session-query/session-query/src/observation.ts
+index 5254a40f..ee4d7788 100644
+--- a/packages/session-query/session-query/src/observation.ts
++++ b/packages/session-query/session-query/src/observation.ts
+@@ -10,7 +10,11 @@ import type {
+ } from '@deepseek-ai/dsh-session-persistence'
+ import type { ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection'
+ import type {} from '@deepseek-ai/dsh-session-projection-cache'
+-import { SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE, SessionQueryError } from './config.ts'
++import {
++  SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES,
++  SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
++  SessionQueryError,
++} from './config.ts'
+ import { readColdSessionLog, type ColdSessionLog } from './cold-read.ts'
+ 
+ /** One exact immutable Session cut retained for the caller's read lifetime. */
+@@ -62,6 +66,8 @@ interface PreparedEntry {
+   readonly session: Session
+   /** Immutable balanced log (stored events plus in-memory interrupted-turn closers). */
+   readonly events: readonly SessionEvent[]
++  /** Estimated decoded-log bytes, or infinity when above the reuse budget. */
++  readonly bytes: number
+   /** Active observation leases; a pinned entry (`refs > 0`) is never evicted. */
+   refs: number
+ }
+@@ -78,14 +84,17 @@ interface PreparedEntry {
+  */
+ export class SessionObservationReader {
+   private readonly cache = new Map<SessionId, PreparedEntry>()
++  private cacheBytes = 0
+ 
+   /**
+    * @param ctx - context carrying Session and optional persistence/projection services.
+    * @param cacheCapacity - maximum unpinned cold observations retained for reuse.
++   * @param cacheMaxBytes - maximum estimated decoded-log bytes retained after release.
+    */
+   constructor(
+     private readonly ctx: Context,
+     private readonly cacheCapacity: number = SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
++    private readonly cacheMaxBytes: number = SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_BYTES,
+   ) {}
+ 
+   /**
+@@ -171,9 +180,9 @@ export class SessionObservationReader {
+           revision: snapshot.revision,
+           session,
+           events: Object.freeze(seed),
++          bytes: decodedLogWeight([session.header, seed], this.cacheMaxBytes),
+           refs: 0,
+         }
+-        this.store(sessionId, entry)
+       }
+ 
+       let projections: ProjectionSnapshot | undefined
+@@ -186,7 +195,9 @@ export class SessionObservationReader {
+           { cause: error },
+         )
+       }
+-      return { observation: this.preparedLease(sessionId, entry, projections), session: entry.session }
++      const observation = this.preparedLease(sessionId, entry, projections)
++      if (this.cache.get(sessionId) !== entry) this.store(sessionId, entry)
++      return { observation, session: entry.session }
+     }
+   }
+ 
+@@ -235,7 +246,9 @@ export class SessionObservationReader {
+     revision: SessionPersistenceRevision,
+   ): PreparedEntry | undefined {
+     const cached = this.cache.get(sessionId)
+-    if (cached === undefined || cached.persistenceIdentity !== persistenceIdentity || cached.revision !== revision) {
++    if (cached === undefined) return undefined
++    if (cached.persistenceIdentity !== persistenceIdentity || cached.revision !== revision) {
++      this.removeCached(sessionId)
+       return undefined
+     }
+     this.cache.delete(sessionId)
+@@ -247,23 +260,30 @@ export class SessionObservationReader {
+   private store(sessionId: SessionId, entry: PreparedEntry): void {
+     // Replacing a stale revision only drops the map's reference; live leases
+     // keep the old entry alive through their own references.
+-    this.cache.delete(sessionId)
++    this.removeCached(sessionId)
+     this.cache.set(sessionId, entry)
+-    this.evictPastCapacity(entry)
++    this.evictPastCapacity()
++  }
++
++  /** Drop the cache's ownership independently of any active leases. */
++  private removeCached(sessionId: SessionId): void {
++    const entry = this.cache.get(sessionId)
++    if (entry === undefined) return
++    this.cacheBytes -= entry.refs === 0 ? entry.bytes : 0
++    this.cache.delete(sessionId)
+   }
+ 
+   /**
+    * Evict oldest unpinned entries until the cache fits its capacity again.
+    * Runs on store and whenever a lease release unpins an entry, so leases
+    * that pinned every candidate cannot leave the cache over budget for good.
+-   * @param keep - the entry being stored, about to be leased; never evicted.
+    */
+-  private evictPastCapacity(keep?: PreparedEntry): void {
+-    if (this.cache.size <= this.cacheCapacity) return
++  private evictPastCapacity(): void {
++    if (this.cache.size <= this.cacheCapacity && this.cacheBytes <= this.cacheMaxBytes) return
+     for (const [id, candidate] of this.cache) {
+-      if (candidate === keep || candidate.refs > 0) continue
+-      this.cache.delete(id)
+-      if (this.cache.size <= this.cacheCapacity) return
++      if (candidate.refs > 0) continue
++      this.removeCached(id)
++      if (this.cache.size <= this.cacheCapacity && this.cacheBytes <= this.cacheMaxBytes) return
+     }
+   }
+ 
+@@ -273,6 +293,7 @@ export class SessionObservationReader {
+     entry: PreparedEntry,
+     projections: ProjectionSnapshot | undefined,
+   ): SessionObservation {
++    if (entry.refs === 0 && this.cache.get(sessionId) === entry) this.cacheBytes -= entry.bytes
+     entry.refs += 1
+     const lease = (): SessionObservation => {
+       let disposed = false
+@@ -293,7 +314,14 @@ export class SessionObservationReader {
+           if (disposed) return
+           disposed = true
+           entry.refs -= 1
+-          if (entry.refs === 0) this.evictPastCapacity()
++          if (entry.refs === 0 && this.cache.get(sessionId) === entry) {
++            if (this.cacheMaxBytes === 0 || entry.bytes > this.cacheMaxBytes) {
++              this.cache.delete(sessionId)
++            } else {
++              this.cacheBytes += entry.bytes
++            }
++            this.evictPastCapacity()
++          }
+         },
+       }
+     }
+@@ -304,6 +332,7 @@ export class SessionObservationReader {
+     session: Session,
+     projectionMode: NonNullable<SessionObservationOptions['projectionMode']>,
+   ): SessionObservation {
++    this.removeCached(session.id)
+     // The cut is the log length now. The log only appends, so the prefix
+     // below `seq` is the same array whenever a consumer first reads `events`.
+     const seq = session.seq
+@@ -353,6 +382,39 @@ export class SessionObservationReader {
+   }
+ }
+ 
++/** Estimate retained JSON weight without serializing strings or copying event arrays. */
++function decodedLogWeight(values: readonly unknown[], budget: number): number {
++  let bytes = 0
++  const seen = new WeakSet<object>()
++  const pending: Iterator<unknown>[] = [values.values()]
++  for (let cursor = pending.at(-1); cursor !== undefined; cursor = pending.at(-1)) {
++    const next = cursor.next()
++    if (next.done === true) {
++      pending.pop()
++      continue
++    }
++    const value: unknown = next.value
++    bytes += 16
++    if (typeof value === 'string') {
++      bytes += 24 + value.length * 2
++    } else if (value !== null && typeof value === 'object' && !seen.has(value)) {
++      seen.add(value)
++      bytes += 48
++      pending.push(Array.isArray(value) ? value.values() : jsonFields(value))
++    }
++    if (bytes > budget) return Number.POSITIVE_INFINITY
++  }
++  return bytes
++}
++
++function* jsonFields(value: object): Generator<unknown> {
++  const record = value as Record<string, unknown>
++  for (const key of Object.keys(record)) {
++    yield key
++    yield record[key]
++  }
++}
++
+ function throwIfObservationAborted(signal: AbortSignal | undefined): void {
+   if (signal?.aborted !== true) return
+   throw new SessionQueryError(
+diff --git a/packages/session-query/session-query/tests/observation.spec.ts b/packages/session-query/session-query/tests/observation.spec.ts
+index 19d345c9..0136a994 100644
+--- a/packages/session-query/session-query/tests/observation.spec.ts
++++ b/packages/session-query/session-query/tests/observation.spec.ts
+@@ -334,6 +334,58 @@ describe('SessionObservationReader cold path', () => {
+     await ctx.fiber.dispose()
+   })
+ 
++  it('shares an oversized observation while leased and drops it on final release', async () => {
++    const ctx = await readerContext()
++    const meta = header('oversized-log')
++    const content = 'research fixture '.repeat(2048)
++    const events = [messageEvent(0, content)]
++    const store = new Map([[meta.id, { header: meta, events, revision: 'r1' }]])
++    const counters = { stat: 0, open: 0, read: 0 }
++    ctx.provide('sessionPersistence', stubPersistence(store, counters))
++    const reader = new SessionObservationReader(ctx, 5, 2048)
++    try {
++      {
++        using first = await reader.read(meta.id, { projectionMode: 'none' })
++        using second = await reader.read(meta.id, { projectionMode: 'none' })
++        expect(counters.read).toBe(1)
++        expect(second.events).toBe(first.events)
++      }
++      using reopened = await reader.read(meta.id, { projectionMode: 'none' })
++      expect(reopened.events).toEqual(events)
++      expect(counters.read).toBe(2)
++    } finally {
++      await ctx.fiber.dispose()
++    }
++  })
++
++  it('evicts the oldest released observation when several medium histories exceed the byte budget', async () => {
++    const ctx = await readerContext()
++    const a = header('bytes-a')
++    const b = header('bytes-b')
++    const events = [messageEvent(0, 'λ'.repeat(2000))]
++    const store = new Map([
++      [a.id, { header: a, events, revision: 'ra' }],
++      [b.id, { header: b, events, revision: 'rb' }],
++    ])
++    const counters = { stat: 0, open: 0, read: 0 }
++    ctx.provide('sessionPersistence', stubPersistence(store, counters))
++    const reader = new SessionObservationReader(ctx, 5, 8000)
++    const openAndRelease = async (id: SessionIdType): Promise<void> => {
++      using observation = await reader.read(id, { projectionMode: 'none' })
++      expect(observation.cursor).toBe(0)
++    }
++    try {
++      await openAndRelease(a.id)
++      await openAndRelease(b.id)
++      await openAndRelease(b.id)
++      expect(counters.read).toBe(2)
++      await openAndRelease(a.id)
++      expect(counters.read).toBe(3)
++    } finally {
++      await ctx.fiber.dispose()
++    }
++  })
++
+   it('continues evicting past pinned entries until the cache reaches its bound', async () => {
+     const ctx = await readerContext()
+     const a = header('sweep-a')
+diff --git a/packages/session/session-format-v3-to-v4/src/relationships.ts b/packages/session/session-format-v3-to-v4/src/relationships.ts
+index aa50b3f3..5a973367 100644
+--- a/packages/session/session-format-v3-to-v4/src/relationships.ts
++++ b/packages/session/session-format-v3-to-v4/src/relationships.ts
+@@ -57,6 +57,7 @@ class Relationships {
+   provider: SessionFormatJsonValue | undefined
+   surface: number[] = []
+   protectedHead: number | undefined
++  readonly inheritedTail: boolean
+   compaction: Compaction | undefined
+   readonly tools = new Map<string, ToolState>()
+   readonly dispatches = new Map<string, { data: SessionFormatJsonObject; settled: boolean }>()
+@@ -66,6 +67,14 @@ class Relationships {
+   readonly orphanCompactions = new Set<number>()
+ 
+   constructor(readonly artifact: SessionFormatArtifact, readonly knownEventTypes: ReadonlySet<string>) {
++    const notice = artifact.events[0]
++    const noticeId = notice?.type === 'user/message' && notice['surfaceOp'] === 'append'
++      && isSessionFormatJsonObject(notice.data) ? notice.data['id'] : undefined
++    // The fork-bounded plugin emits a synthetic notice, followed by the
++    // parent turn skeleton with original turn numbers and no system prompt.
++    this.inheritedTail = artifact.inheritedEventCount > 1 && artifact.header.origin === 'subagent'
++      && artifact.header.parentSession !== undefined && artifact.events[1]?.type === 'turn/start'
++      && typeof noticeId === 'string' && noticeId.startsWith('fork-bounded-')
+     let start: number | undefined
+     for (const event of artifact.events) {
+       if (!knownEventTypes.has(event.type)) continue
+@@ -123,7 +132,11 @@ class Relationships {
+ 
+   foldSurface(event: SessionFormatEvent): void {
+     if (!SURFACE_TYPES.has(event.type)) return
+-    if (event.type === 'system/message' && this.surface.length > 0 && this.protectedHead === undefined) {
++    // A trimmed child can record its own system prompt after the inherited
++    // surface. Only a system prompt at node zero has head protection.
++    const appendedAfterSeed = this.inheritedTail && event.seq > this.artifact.inheritedEventCount
++      && event['surfaceOp'] === 'append'
++    if (event.type === 'system/message' && this.surface.length > 0 && this.protectedHead === undefined && !appendedAfterSeed) {
+       throw new SessionFormatError('system/message requires a protected first surface head')
+     }
+     if (event['surfaceOp'] === 'append') {
+@@ -272,12 +285,20 @@ class Relationships {
+     }
+     this.foldSurface(event)
+     switch (event.type) {
+-      case 'turn/start':
+-        if (this.turn !== null || data['turn'] !== this.nextTurn) throw new SessionFormatError('turn/start does not open the expected turn')
+-        this.turn = this.nextTurn
++      case 'turn/start': {
++        const turn = sessionFormatCount(data['turn'], 'turn/start turn')
++        // An inherited subagent tail can omit earlier parent turns while
++        // retaining their original numbering. Later turns still advance by one.
++        const inheritedBase = this.inheritedTail && event.seq === 1 && turn > 1
++        if (this.turn !== null || (turn !== this.nextTurn && !inheritedBase)) {
++          throw new SessionFormatError('turn/start does not open the expected turn')
++        }
++        this.turn = turn
++        this.nextTurn = turn
+         this.nextStep = 1
+         this.tools.clear()
+         break
++      }
+       case 'turn/end':
+         if (this.turn === null || data['turn'] !== this.turn || this.step !== null) throw new SessionFormatError('turn/end does not match the open turn with no open step')
+         this.closeTools(event.type)
+diff --git a/packages/session/session-format-v3-to-v4/tests/relationships.spec.ts b/packages/session/session-format-v3-to-v4/tests/relationships.spec.ts
+index 5103fa8b..794f6490 100644
+--- a/packages/session/session-format-v3-to-v4/tests/relationships.spec.ts
++++ b/packages/session/session-format-v3-to-v4/tests/relationships.spec.ts
+@@ -23,8 +23,8 @@ const toolCall = () => row('tool/call', { ...step, callId: 'call', name: 'read',
+ const request = () => row('request/header', { reason: 'initial', header: { config: { provider: 'mock', model: 'mock' } } })
+ 
+ /** Exercise physical JSON, catalog relationship admission, Session adoption, and derivation together. */
+-function reopen(rows: readonly Row[], inherited = 0, seeded = false) {
+-  const restore = sessionFormatCatalog.createRestore({ type: 'session', version: 4, id: 'native-relations', createdAt: 1, delegationDepth: 0, isSeeded: seeded, ...(seeded ? { parentSession: 'parent' } : {}) }, { recovery: 'strict', validation: 'current' })
++function reopen(rows: readonly Row[], inherited = 0, seeded = false, origin?: 'subagent') {
++  const restore = sessionFormatCatalog.createRestore({ type: 'session', version: 4, id: 'native-relations', createdAt: 1, delegationDepth: origin ? 1 : 0, isSeeded: seeded, ...(seeded ? { parentSession: 'parent' } : {}), ...(origin ? { origin } : {}) }, { recovery: 'strict', validation: 'current' })
+   for (const [seq, candidate] of rows.entries()) {
+     const event = { ...candidate, seq, time: seq + 1 } as unknown as SessionFormatEvent
+     restore.decodeRow(JSON.parse(JSON.stringify(sessionFormatCatalog.encodeCurrentEvent(event))))
+@@ -188,6 +188,27 @@ describe('mandatory V4 dependent event restoration', () => {
+ 
+ describe('V4 protected system surface and malformed relationship inputs', () => {
+   const system = (): Row => ({ ...row('system/message', { ...step, message: { id: 'system', role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'system' }] } }), surfaceOp: 'append' })
++  it('reads trimmed subagent seeds without renumbering turns or relocating prompts', () => {
++    const close = (turn: number) => row('turn/end', { turn, reason: { kind: 'completed' } })
++    const notice = { ...input(), data: { ...user(), id: 'fork-bounded-seed-notice' } }
++    const prefix = [notice, row('turn/start', { turn: 253 }), close(253)]
++    const marker = row('session/end-seed', { inherited: true })
++    const owned = [row('turn/start', { turn: 254 }), row('step/start', { turn: 254, step: 1 }),
++      { ...system(), data: { ...system().data, turn: 254 } }]
++    const restored = reopen([...prefix, marker, ...owned], 3, true, 'subagent')
++    expect(restored.artifact.events.filter(event => event.type === 'turn/start').map(event => event.data)).toEqual([{ turn: 253 }, { turn: 254 }])
++    expect(restored.messages.map(message => message.role)).toEqual(['user', 'system'])
++    expect(() => reopen([...prefix, marker, ...owned], 3, true)).toThrow(/expected turn/)
++    expect(() => reopen([input(), ...prefix.slice(1), marker, ...owned], 3, true, 'subagent')).toThrow(/expected turn/)
++    expect(() => reopen([notice, marker, row('turn/start', { turn: 253 })], 1, true, 'subagent')).toThrow(/expected turn/)
++    expect(() => reopen([...prefix, marker, row('turn/start', { turn: 255 })], 3, true, 'subagent')).toThrow(/expected turn/)
++    expect(() => reopen([notice, row('turn/start', { turn: 253 }), row('step/start', { turn: 253, step: 1 }),
++      { ...system(), data: { ...system().data, turn: 253 } }, marker], 4, true, 'subagent')).toThrow(/protected first surface head/)
++    expect(reopen([notice, row('turn/start', { turn: 1 }), close(1), marker, row('turn/start', { turn: 2 }),
++      row('step/start', { turn: 2, step: 1 }), { ...system(), data: { ...system().data, turn: 2 } }], 3, true, 'subagent')
++      .messages.map(message => message.role)).toEqual(['user', 'system'])
++  })
++
+   it('keeps the first system head protected across exact replacements', () => {
+     const replacement = { ...system(), surfaceOp: { op: 'replace', startSeq: 2, endSeq: 2 }, sourceEventSeqs: [2] }
+     expect(() => reopen([...begin(), system(), input(), replacement, system(), ...end()])).not.toThrow()
+diff --git a/packages/session/session-persistence-jsonl/README.md b/packages/session/session-persistence-jsonl/README.md
+index 2de63df3..27b4be3f 100644
+--- a/packages/session/session-persistence-jsonl/README.md
++++ b/packages/session/session-persistence-jsonl/README.md
+@@ -86,6 +86,8 @@ Materialized `stat` and `list` snapshots include the format catalog's header cla
+ 
+ `open(id, 'read'|'write')` selects the highest canonical generation. Current input follows the ordinary fast path. For historical input, a read open decodes and migrates the source once, validates the current logical result, and returns it without publishing a successor. A write open reuses that revision-keyed preparation when available, or performs the same preparation, then encodes a same-directory temporary file in bounded chunks, verifies it in a Worker Thread, rechecks the source revision, and publishes the current successor without overwrite before returning. The source remains byte-identical. Source drift after preparation rejects that write open without replacing the logical history already returned to readers; a later write open prepares the new revision. The backend marks decoded event graphs `shared-frozen` when it freezes them before memoization; every nested object and array is frozen, and handle reads and slices preserve that state, including empty slices. Only an unmaterialized pending log reports `detached`. `stat(id)` and `list()` select and translate only the highest generation header without reading event rows or starting migration; snapshots carry the selected file’s `sizeBytes` and a best-effort revision. Current revisions identify that file; historical revisions also fingerprint the selected files across the persistence root, so child changes invalidate cached logical events. Fingerprinting reads filesystem metadata only; unrelated changes conservatively invalidate historical revisions. One `list()` call shares a corpus fingerprint across its historical entries. With `compression: 'none'`, the log is newline-delimited text an external reader can consume directly; the compressed default must be read through the backend.
+ 
++Concurrent opens of the same selected file revision share one decode. Cancelling one caller releases its wait. The backend cancels the shared decode when the last caller leaves.
++
+ Verification accepts a successful Worker response only after the Worker exits naturally with code 0. Its concurrency slot remains held through that exit; cancellation and Worker errors terminate and join the Worker before rejecting.
+ 
+ Historical body preparation completes the parent catalog through [V3→V4](../session-format-v3-to-v4/README.md). It finds candidate direct children from headers, reads each child's own descriptor through historical codecs, and retains compact evidence plus source revisions. It neither prepares child catalogs nor publishes child successors. Unreadable or unsupported headers, including corrupt Zstandard header frames, are omitted from discovery and `list()`. Direct access to a corrupt compressed header still rejects; header I/O and cancellation errors propagate. Child decoding and descriptor-field failures produce warnings naming the child path and retain header identity through `subagent/catalog` when the parent has no complete entry; healthy children and existing parent catalog entries remain available. Opening a damaged child still reports that child's error. Missing, unsupported, or multiple descriptors likewise produce unknown-mode membership without inventing a label. Published unknown entries remain browsable; child history reads retry the actual log and resolve its mode from a valid descriptor. Preparation rechecks membership and inspected source revisions before returning, reuse, and publication, including failed child reads so a repaired child invalidates stale preparation. Source drift retries a read open once and refuses a write open. Cancellation still aborts the operation. Current V4 opens bypass discovery and validate catalog fields, uniqueness, and current delivery ownership before exposing events.
+diff --git a/packages/session/session-persistence-jsonl/README.zh.md b/packages/session/session-persistence-jsonl/README.zh.md
+index e5494de7..9d89ce6e 100644
+--- a/packages/session/session-persistence-jsonl/README.zh.md
++++ b/packages/session/session-persistence-jsonl/README.zh.md
+@@ -86,6 +86,8 @@ kind: "package-reference"
+ 
+ `open(id, 'read'|'write')` 选择最高规范 generation。当前格式输入走普通快速路径。对于历史输入，只读 open 会单遍解码并迁移源、校验当前逻辑结果，然后在不发布后继的情况下返回。写 open 会在可用时复用按 revision 为键的 preparation，否则执行同一套 preparation，再按有界分片编码同目录临时文件、在 Worker Thread 中校验、复查源修订，并在返回前以不覆盖方式发布当前后继。源保持逐字节不变。如果源在 preparation 后发生变化，该次写 open 会失败，已经返回给读方的逻辑历史不会被替换；后续写 open 会针对新的 revision 重新执行 preparation。后端在 memo 化前冻结已解码的 event graph，并在此时将其标记为 `shared-frozen`；每个嵌套对象和数组都会冻结，句柄读取和 slice 即使为空也保留该状态。只有尚未实体化的 pending 空日志报告 `detached`。`stat(id)` 与 `list()` 只选择并转换最高 generation 的 header，不读取事件行，也不启动迁移；快照携带所选文件的 `sizeBytes` 与尽力而为的修订号。当前格式修订号标识该文件；历史格式修订号还包含持久化根目录中所选文件的指纹，因此子日志变化会使缓存的逻辑事件失效。指纹只读取文件系统元数据；无关变化也会保守地使历史修订号失效。一次 `list()` 为其历史条目共用一个全库指纹。选择 `compression: 'none'` 后，日志是外部读取方可直接消费的换行分隔文本；压缩默认值必须经后端读取。
+ 
++并发打开同一文件修订版时，各调用共享一次解码。单个调用取消时会结束自己的等待。最后一个等待者退出后，后端会取消共享解码。
++
+ 校验只有在 Worker 自然以退出码 0 结束后，才接受其成功响应。并发配额一直保留到该次退出；取消或 Worker 错误会先终止并等待 Worker 退出，再使校验失败。
+ 
+ 历史正文准备通过 [V3→V4](../session-format-v3-to-v4/README.zh.md) 补齐父目录：从 header 找到候选直属子 Session，通过历史编解码器逐个读取其自身 descriptor，保留紧凑证据与来源修订。此过程不准备子目录，也不发布子后继。不可读或不支持的 header（包括损坏的 Zstandard header 帧）不参与发现，也不出现在 `list()` 中。直接访问损坏的压缩 header 仍会失败；header 的 I/O 错误与取消错误继续传播。子日志解码或 descriptor 字段失败会产生带子路径的警告；父目录没有完整条目时，通过 `subagent/catalog` 保留 header 身份信息。健康子项和已有父目录项仍可使用。打开损坏子 Session 时仍报告该子会话的错误。缺失、不支持或多个 descriptor 同样生成模式未知的目录项，不编造标签。已发布的未知条目仍可浏览；读取子历史时会重试实际日志，并从有效 descriptor 确定模式。准备返回、复用与发布前会重新检查成员集合及已检查来源的修订，也包括读取失败的子日志，使修复后的子日志能够使旧准备缓存失效。来源变化时只读打开重试一次，写打开拒绝发布。取消仍会中止操作。当前 V4 打开跳过发现，并在暴露事件前校验目录字段、唯一性及当前投递归属。
+diff --git a/packages/session/session-persistence-jsonl/src/index.ts b/packages/session/session-persistence-jsonl/src/index.ts
+index f8351fa9..d71d3387 100644
+--- a/packages/session/session-persistence-jsonl/src/index.ts
++++ b/packages/session/session-persistence-jsonl/src/index.ts
+@@ -32,7 +32,7 @@ import {
+   type SessionPersistenceSnapshot, type SessionPersistenceStatOptions,
+   type SessionPersistenceRevision as PersistenceRevision,
+ } from '@deepseek-ai/dsh-session-persistence'
+-import { JsonlBackendTracker, JsonlSessionHandle, type StorageHandleState } from './storage.ts'
++import { JsonlBackendTracker, JsonlSessionHandle, type InitialCurrentLog, type StorageHandleState } from './storage.ts'
+ import { SessionWriteLease } from './lease.ts'
+ import { SESSION_FORMAT_VERSION, SessionId as makeSessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+ import type { SessionEvent, SessionId, SessionHeader, SessionLogOffset as SessionLogOffsetType } from '@deepseek-ai/dsh-session'
+@@ -186,12 +186,13 @@ interface ResolvedJsonlGeneration {
+   readonly currentPath: string
+ }
+ 
+-/** One backend-owned historical preparation shared by its current callers. */
+-interface MigrationPreparation {
++/** One backend-owned stored-log decode shared by its current callers. */
++interface StoredLogPreparation {
+   readonly sourcePath: string
+   readonly sourceRevision: PersistenceRevision
++  readonly operationLabel: string
+   readonly controller: AbortController
+-  readonly promise: Promise<PreparedStoredLog>
++  readonly promise: Promise<StoredLog>
+   settled: boolean
+   waiters: number
+ }
+@@ -248,20 +249,20 @@ function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+ }
+ 
+ /** Preserve an Error abort reason and normalize hostile non-Error reasons. */
+-function abortError(signal: AbortSignal): Error {
++function abortError(signal: AbortSignal, operationLabel: string): Error {
+   return signal.reason instanceof Error
+     ? signal.reason
+-    : new Error('session migration preparation aborted', { cause: signal.reason })
++    : new Error(operationLabel + ' aborted', { cause: signal.reason })
+ }
+ 
+ /** Let one caller stop waiting without transferring cancellation ownership to shared work. */
+-function waitWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
++function waitWithAbort<T>(operation: Promise<T>, operationLabel: string, signal?: AbortSignal): Promise<T> {
+   if (signal === undefined) return operation
+   /* v8 ignore next -- requireStoredLog synchronously rechecks the signal immediately before waiting. */
+-  if (signal.aborted) return Promise.reject(abortError(signal))
++  if (signal.aborted) return Promise.reject(abortError(signal, operationLabel))
+   return new Promise<T>((resolve, reject) => {
+     const stopWaiting = (): void => {
+-      reject(abortError(signal))
++      reject(abortError(signal, operationLabel))
+     }
+     signal.addEventListener('abort', stopWaiting, { once: true })
+     void operation.then(
+@@ -275,7 +276,7 @@ function waitWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<
+         if (error instanceof Error) {
+           reject(error)
+         } else {
+-          reject(new Error('session migration preparation failed', { cause: error }))
++          reject(new Error(operationLabel + ' failed', { cause: error }))
+         }
+       },
+     )
+@@ -309,9 +310,9 @@ class JsonlSessionPersistence extends SessionPersistence {
+    * for an id invalidates its entry; a foreign write misses through the
+    * revision guard.
+    */
+-  private readonly coldLogMemo = new Map<SessionId, StoredLog>()
+-  /** One joinable decode/migration operation per selected historical Session file revision. */
+-  private readonly migrationPreparations = new Map<SessionId, MigrationPreparation>()
++  private readonly coldLogMemo = new Map<SessionId, WeakRef<StoredLog>>()
++  /** One joinable decode per selected Session file revision. */
++  private readonly storedLogPreparations = new Map<SessionId, StoredLogPreparation>()
+ 
+   constructor(ctx: Context, public config: Config, private readonly tracker: JsonlBackendTracker) {
+     super(ctx)
+@@ -414,6 +415,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+           cursor: 0,
+           materialized: true,
+           inheritedEventCount: stored.inheritedEventCount,
++          initialCurrent: stored,
+         }
+       }
+       return this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, 'read', state))
+@@ -571,33 +573,8 @@ class JsonlSessionPersistence extends SessionPersistence {
+     if (selected === undefined) throw new SessionPersistenceNotFoundError(id)
+     if (selected.sourceVersion < SESSION_FORMAT_VERSION) {
+       const sourceRevision = fileRevision(await stat(selected.sourcePath, { bigint: true }))
+-      signal?.throwIfAborted()
+-      let preparation = this.migrationPreparations.get(id)
+-      if (preparation === undefined
+-        || preparation.sourcePath !== selected.sourcePath
+-        || preparation.sourceRevision !== sourceRevision) {
+-        const controller = new AbortController()
+-        const promise = this.loadStoredMigration(id, selected, sourceRevision, controller.signal)
+-        preparation = {
+-          sourcePath: selected.sourcePath,
+-          sourceRevision,
+-          controller,
+-          promise,
+-          settled: false,
+-          waiters: 0,
+-        }
+-        this.migrationPreparations.set(id, preparation)
+-        const created = preparation
+-        const release = (): void => {
+-          created.settled = true
+-          if (this.migrationPreparations.get(id) === created) {
+-            this.migrationPreparations.delete(id)
+-          }
+-        }
+-        void promise.then(release, release)
+-      }
+-      signal?.throwIfAborted()
+-      return this.waitForPreparation(id, preparation, signal)
++      return this.joinStoredPreparation(id, selected.sourcePath, sourceRevision, 'session migration preparation',
++        preparationSignal => this.loadStoredMigration(id, selected, sourceRevision, preparationSignal), signal)
+     }
+     if (selected.sourceVersion > SESSION_FORMAT_VERSION) {
+       const header = await this.readGenerationHeader(selected, id, signal)
+@@ -615,20 +592,56 @@ class JsonlSessionPersistence extends SessionPersistence {
+       )
+     }
+     const probe = fileRevision(await stat(selected.sourcePath, { bigint: true }))
+-    const memoized = this.coldLogMemo.get(id)
++    signal?.throwIfAborted()
++    const memoized = this.coldLogMemo.get(id)?.deref()
+     if (memoized?.status === 'current' && memoized.revision === probe) {
+-      this.coldLogMemo.delete(id)
+-      this.coldLogMemo.set(id, memoized)
++      this.memoizeStoredLog(id, memoized)
+       return memoized
+     }
+-    const current = await readStableJsonlFile(selected.sourcePath, signal)
+-    return this.decodeStoredLog(
+-      selected.sourcePath,
+-      id,
+-      current.bytes,
+-      fileRevision(current.identity),
+-      signal,
+-    )
++    return this.joinStoredPreparation(id, selected.sourcePath, probe, 'session log read', async preparationSignal => {
++      const current = await readStableJsonlFile(selected.sourcePath, preparationSignal)
++      return this.decodeStoredLog(
++        selected.sourcePath,
++        id,
++        current.bytes,
++        fileRevision(current.identity),
++        preparationSignal,
++      )
++    }, signal)
++  }
++
++  /** Share one file decode while giving each caller independent cancellation. */
++  private joinStoredPreparation(
++    id: SessionId,
++    sourcePath: string,
++    sourceRevision: PersistenceRevision,
++    operationLabel: string,
++    load: (signal: AbortSignal) => Promise<StoredLog>,
++    signal?: AbortSignal,
++  ): Promise<StoredLog> {
++    signal?.throwIfAborted()
++    const existing = this.storedLogPreparations.get(id)
++    if (existing?.sourcePath === sourcePath && existing.sourceRevision === sourceRevision) {
++      return this.waitForPreparation(id, existing, signal)
++    }
++    const controller = new AbortController()
++    const promise = load(controller.signal)
++    const preparation: StoredLogPreparation = {
++      sourcePath,
++      sourceRevision,
++      operationLabel,
++      controller,
++      promise,
++      settled: false,
++      waiters: 0,
++    }
++    this.storedLogPreparations.set(id, preparation)
++    const release = (): void => {
++      preparation.settled = true
++      if (this.storedLogPreparations.get(id) === preparation) this.storedLogPreparations.delete(id)
++    }
++    void promise.then(release, release)
++    return this.waitForPreparation(id, preparation, signal)
+   }
+ 
+   /** Probe the memo and otherwise decode one historical generation under backend cancellation. */
+@@ -639,16 +652,16 @@ class JsonlSessionPersistence extends SessionPersistence {
+     signal: AbortSignal,
+   ): Promise<PreparedStoredLog> {
+     signal.throwIfAborted()
+-    const memoized = this.coldLogMemo.get(id)
++    const reference = this.coldLogMemo.get(id)
++    const memoized = reference?.deref()
+     if (memoized?.status === 'prepared' && memoized.revision === sourceRevision) {
+       try {
+         await memoized.validateRelatedSources()
+       } catch (error: unknown) {
+-        this.coldLogMemo.delete(id)
++        if (this.coldLogMemo.get(id) === reference) this.coldLogMemo.delete(id)
+         throw this.generationFailure(id, selected, error)
+       }
+-      this.coldLogMemo.delete(id)
+-      this.coldLogMemo.set(id, memoized)
++      if (this.coldLogMemo.get(id) === reference) this.memoizeStoredLog(id, memoized)
+       return memoized
+     }
+     return this.prepareStoredMigration(id, selected, signal)
+@@ -657,18 +670,18 @@ class JsonlSessionPersistence extends SessionPersistence {
+   /** Await shared preparation for one caller and abort it only after its last waiter leaves. */
+   private async waitForPreparation(
+     id: SessionId,
+-    preparation: MigrationPreparation,
++    preparation: StoredLogPreparation,
+     signal?: AbortSignal,
+-  ): Promise<PreparedStoredLog> {
++  ): Promise<StoredLog> {
+     preparation.waiters += 1
+     try {
+-      return await waitWithAbort(preparation.promise, signal)
++      return await waitWithAbort(preparation.promise, preparation.operationLabel, signal)
+     } finally {
+       preparation.waiters -= 1
+       if (preparation.waiters === 0 && !preparation.settled) {
+         /* v8 ignore else -- a newer selected source may already own this id's preparation slot. */
+-        if (this.migrationPreparations.get(id) === preparation) {
+-          this.migrationPreparations.delete(id)
++        if (this.storedLogPreparations.get(id) === preparation) {
++          this.storedLogPreparations.delete(id)
+         }
+         preparation.controller.abort()
+       }
+@@ -751,7 +764,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+       identity = await migration.value.publish()
+     } catch (error: unknown) {
+       /* v8 ignore else -- a newer preparation may have replaced this stale cache entry. */
+-      if (this.coldLogMemo.get(id) === stored) this.coldLogMemo.delete(id)
++      if (this.coldLogMemo.get(id)?.deref() === stored) this.coldLogMemo.delete(id)
+       throw this.generationFailure(id, migration.source, error)
+     }
+     const published: CurrentStoredLog = {
+@@ -796,15 +809,19 @@ class JsonlSessionPersistence extends SessionPersistence {
+    * @param path - the artifact file to read.
+    * @param expectedId - the session identity the artifact must carry.
+    * @param signal - optional cancellation for the stat/read/decode work.
+-   * @returns the validated stored log with any torn-tail truncation point.
++   * @param initial - current log decoded at read open, reusable at the same revision.
++   * @returns the validated stored log.
+    */
+-  async readStoredLog(path: string, expectedId: SessionId, signal?: AbortSignal): Promise<CurrentStoredLog> {
++  async readStoredLog(
++    path: string, expectedId: SessionId, signal?: AbortSignal, initial?: InitialCurrentLog,
++  ): Promise<SessionHandleReadResult> {
+     signal?.throwIfAborted()
+     const probe = fileRevision(await stat(path, { bigint: true }))
+-    const memoized = this.coldLogMemo.get(expectedId)
++    signal?.throwIfAborted()
++    if (initial?.revision === probe) return initial
++    const memoized = this.coldLogMemo.get(expectedId)?.deref()
+     if (memoized?.status === 'current' && memoized.revision === probe) {
+-      this.coldLogMemo.delete(expectedId)
+-      this.coldLogMemo.set(expectedId, memoized)
++      this.memoizeStoredLog(expectedId, memoized)
+       return memoized
+     }
+     const { bytes, identity } = await readStableJsonlFile(path, signal)
+@@ -871,10 +888,10 @@ class JsonlSessionPersistence extends SessionPersistence {
+     return stored
+   }
+ 
+-  /** Insert one parsed log into the bounded handoff cache. */
++  /** Index a parsed log without keeping closed log graphs reachable. */
+   private memoizeStoredLog(id: SessionId, stored: StoredLog): void {
+     this.coldLogMemo.delete(id)
+-    this.coldLogMemo.set(id, stored)
++    this.coldLogMemo.set(id, new WeakRef(stored))
+     for (const oldest of this.coldLogMemo.keys()) {
+       if (this.coldLogMemo.size <= COLD_LOG_MEMO_MAX_ENTRIES) break
+       this.coldLogMemo.delete(oldest)
+diff --git a/packages/session/session-persistence-jsonl/src/storage.ts b/packages/session/session-persistence-jsonl/src/storage.ts
+index 197dcbc2..2e0ff877 100644
+--- a/packages/session/session-persistence-jsonl/src/storage.ts
++++ b/packages/session/session-persistence-jsonl/src/storage.ts
+@@ -35,6 +35,11 @@ import type { SessionWriteLease } from './lease.ts'
+ /** Maximum intentional wait before a routed live session batch starts writing. */
+ export const LIVE_WRITE_BATCH_MAX_DELAY_MS = 200
+ 
++/** Exact current-generation log held from open through its first read. */
++export interface InitialCurrentLog extends SessionHandleReadResult {
++  readonly revision: SessionPersistenceRevision
++}
++
+ /** The file-storage primitives the handle drives on its owning service. */
+ export interface JsonlHandleStorage {
+   /** Append encoded lines; `isMaterialized` selects create-vs-extend publication. */
+@@ -51,7 +56,9 @@ export interface JsonlHandleStorage {
+   /** Resolve the current-generation artifact path, or `undefined` when absent. */
+   resolveCurrentLog(id: SessionId, signal?: AbortSignal): Promise<string | undefined>
+   /** Read and validate the stored log at `path`, including its established event aliasing state. */
+-  readStoredLog(path: string, expectedId: SessionId, signal?: AbortSignal): Promise<SessionHandleReadResult>
++  readStoredLog(
++    path: string, expectedId: SessionId, signal?: AbortSignal, initial?: InitialCurrentLog,
++  ): Promise<SessionHandleReadResult>
+   /** Whether the id is still a created-but-unmaterialized session here. */
+   hasPendingSession(id: SessionId): boolean
+   /** Acquire the session's cross-process write lock in its artifact directory. */
+@@ -74,6 +81,8 @@ export interface StorageHandleState {
+   inheritedEventCount: SessionLogOffset
+   /** The validated stored prefix from a write open, served to reads until the first append. */
+   primed?: SessionHandleReadResult | undefined
++  /** Current-generation read open, retained until the first revision-checked read. */
++  initialCurrent?: InitialCurrentLog | undefined
+ }
+ 
+ /**
+@@ -126,6 +135,8 @@ export class JsonlSessionHandle implements SessionHandle {
+       throw new TypeError(`read length must be a non-negative safe integer, got ${String(length)}`)
+     }
+     options?.signal?.throwIfAborted()
++    const initial = this.state.initialCurrent
++    this.state.initialCurrent = undefined
+     let result: SessionHandleReadResult
+     const primed = this.state.primed
+     if (primed !== undefined) {
+@@ -145,7 +156,7 @@ export class JsonlSessionHandle implements SessionHandle {
+     } else {
+       const currentPath = await this.storage.resolveCurrentLog(this.id, options?.signal)
+       if (currentPath !== undefined) {
+-        result = await this.readCurrent(currentPath, offset, length, options?.signal)
++        result = await this.readCurrent(currentPath, offset, length, options?.signal, initial)
+       } else if (this.storage.hasPendingSession(this.id)) {
+         result = { eventState: 'detached', events: [] }
+       } else {
+@@ -167,8 +178,9 @@ export class JsonlSessionHandle implements SessionHandle {
+     offset: number,
+     length: number,
+     signal?: AbortSignal,
++    initial?: InitialCurrentLog,
+   ): Promise<SessionHandleReadResult> {
+-    const source = await this.storage.readStoredLog(path, this.id, signal)
++    const source = await this.storage.readStoredLog(path, this.id, signal, initial)
+     if (source.events.length < this.observedLength) {
+       throw new Error(`session "${this.id}": stored log shrank below a previously observed prefix (${source.events.length} < ${this.observedLength})`)
+     }
+@@ -222,6 +234,8 @@ export class JsonlSessionHandle implements SessionHandle {
+    */
+   close(): Promise<void> {
+     return this.closing ??= (async () => {
++      this.state.initialCurrent = undefined
++      this.state.primed = undefined
+       let drainFailure: unknown
+       // Producers on other fibers may still publish while close waits for
+       // in-flight mutations (root disposal is concurrent), so drain again
+diff --git a/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts b/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts
+index 82f9f5b6..68e4c866 100644
+--- a/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts
++++ b/packages/session/session-persistence-jsonl/tests/jsonl.spec.ts
+@@ -899,18 +899,24 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
+     }
+   })
+ 
+-  it('lets one historical-open caller abort without cancelling another waiter', async () => {
+-    const header = meta('released-v0-shared-cancellation', '/work')
+-    const sourcePath = historicalLogPath(root, header.cwd, header.id)
+-    await mkdir(dirname(sourcePath), { recursive: true })
+-    await writeFile(sourcePath, `${JSON.stringify(releasedV0Header(header))}\n`)
++  it.each(['historical', 'current'])('lets one %s open caller abort without cancelling another waiter', async format => {
++    const header = meta(format + '-shared-cancellation', '/work')
++    const sourcePath = format === 'historical'
++      ? historicalLogPath(root, header.cwd, header.id)
++      : rawLogPath(root, '/work', header.id)
++    if (format === 'historical') {
++      await mkdir(dirname(sourcePath), { recursive: true })
++      await writeFile(sourcePath, `${JSON.stringify(releasedV0Header(header))}\n`)
++    } else {
++      await writeLog(ctx.sessionPersistence, header, oneTurnLog())
++    }
+     const pause = pausePhysicalRead(sourcePath)
+     readTally.enabled = true
+     const controller = new AbortController()
+-    const reason = new Error('first historical waiter cancelled')
++    const reason = new Error('first waiter cancelled')
+ 
+     const internals = ctx.sessionPersistence as unknown as {
+-      migrationPreparations: Map<SessionId, { waiters: number }>
++      storedLogPreparations: Map<SessionId, { waiters: number }>
+     }
+     const first = ctx.sessionPersistence.open(header.id, 'read', { signal: controller.signal })
+     const second = ctx.sessionPersistence.open(header.id, 'read')
+@@ -918,12 +924,12 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
+     try {
+       await pause.entered
+       // Both callers must join the preparation before either caller leaves it.
+-      await expect.poll(() => internals.migrationPreparations.get(header.id)?.waiters).toBe(2)
++      await expect.poll(() => internals.storedLogPreparations.get(header.id)?.waiters).toBe(2)
+       controller.abort(reason)
+       await expect(first).rejects.toBe(reason)
+       pause.release()
+       const handle = await second
+-      expect((await handle.read()).events).toEqual([])
++      expect((await handle.read()).events).toEqual(format === 'historical' ? [] : oneTurnLog())
+       expect(readTally.bySuffix.get(sourcePath)).toBe(1)
+     } finally {
+       controller.abort(reason)
+@@ -1572,18 +1578,16 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
+ 
+ 
+ 
+-  it('an unchanged cold log parses once across an observe-then-resume handoff', async () => {
++  it('read and write opens share a decoded log while its current revision is held', async () => {
+     const m = meta('memo-handoff', '/work')
+     await writeLog(ctx.sessionPersistence, m, oneTurnLog())
+     const path = rawLogPath(root, '/work', m.id)
+     readTally.enabled = true
+ 
+-    // The observation's read parses the artifact...
+-    expect((await readAll(ctx.sessionPersistence, m.id)).events).toEqual(oneTurnLog())
++    await using reader = await ctx.sessionPersistence.open(m.id, 'read')
+     expect(readTally.bySuffix.get(path)).toBe(1)
+-    // ...and the immediate write-open (resume) reuses the parsed log through
+-    // the revision guard instead of re-reading the file.
+-    const writer = await ctx.sessionPersistence.open(m.id, 'write')
++    await using writer = await ctx.sessionPersistence.open(m.id, 'write')
++    expect((await reader.read()).events).toEqual(oneTurnLog())
+     expect((await writer.read()).events.length).toBe(oneTurnLog().length)
+     expect(readTally.bySuffix.get(path)).toBe(1)
+ 
+@@ -1598,6 +1602,24 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
+     expect(readTally.bySuffix.get(path)).toBe(2)
+   })
+ 
++  it('concurrent cold readers share one decode and the same frozen event objects', async () => {
++    const header = meta('concurrent-current-decode', '/work')
++    await writeLog(ctx.sessionPersistence, header, oneTurnLog())
++    const path = rawLogPath(root, '/work', header.id)
++    readTally.enabled = true
++
++    const readers = await Promise.all(Array.from({ length: 6 }, () => ctx.sessionPersistence.open(header.id, 'read')))
++    try {
++      const reads = await Promise.all(readers.map(reader => reader.read()))
++      const first = reads[0]?.events
++      expect(first).toEqual(oneTurnLog())
++      for (const read of reads) expect(read.events[0]).toBe(first?.[0])
++      expect(readTally.bySuffix.get(path)).toBe(1)
++    } finally {
++      await Promise.all(readers.map(reader => reader.close()))
++    }
++  })
++
+   it('a foreign write misses the memo through the revision guard', async () => {
+     const m = meta('memo-foreign', '/work')
+     await writeLog(ctx.sessionPersistence, m, oneTurnLog())
+@@ -1629,8 +1651,9 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
+ 
+     await readAll(ctx.sessionPersistence, first.id)
+     await readAll(ctx.sessionPersistence, second.id)
+-    await readAll(ctx.sessionPersistence, third.id) // evicts the first id
+-    await readAll(ctx.sessionPersistence, third.id) // still memoized
++    await using thirdOwner = await ctx.sessionPersistence.open(third.id, 'read')
++    await readAll(ctx.sessionPersistence, third.id) // shares the live handoff
++    expect((await thirdOwner.read()).events).toEqual(oneTurnLog())
+     await readAll(ctx.sessionPersistence, first.id) // re-parses after eviction
+     expect(readTally.bySuffix.get(rawLogPath(root, '/work', first.id))).toBe(2)
+     expect(readTally.bySuffix.get(rawLogPath(root, '/work', third.id))).toBe(1)
+@@ -1641,6 +1664,7 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
+     await writeLog(ctx.sessionPersistence, m, oneTurnLog())
+     const handle = await ctx.sessionPersistence.open(m.id, 'read')
+     try {
++      await handle.read()
+       const internals = ctx.sessionPersistence as unknown as { coldLogMemo: Map<SessionId, unknown> }
+       internals.coldLogMemo.clear()
+       statRace.path = rawLogPath(root, '/work', m.id)
+@@ -1655,6 +1679,20 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
+     }
+   })
+ 
++  it('the first current read sees a revision that advanced after read open', async () => {
++    const header = meta('memo-open-revision', '/work')
++    await writeLog(ctx.sessionPersistence, header, oneTurnLog())
++    await using reader = await ctx.sessionPersistence.open(header.id, 'read')
++    {
++      await using writer = await ctx.sessionPersistence.open(header.id, 'write')
++      await writer.append([
++        { type: 'turn/start', seq: SessionSeq(6), time: 9, data: { turn: 2 } },
++        { type: 'turn/end', seq: SessionSeq(7), time: 10, data: { turn: 2, reason: { kind: 'completed' } } },
++      ])
++    }
++    expect((await reader.read()).events.map(event => event.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
++  })
++
+   it('a continuously churning revision yields the committed prefix instead of looping', async () => {
+     const m = meta('read-revision-churn', '/work')
+     await writeLog(ctx.sessionPersistence, m, oneTurnLog())
